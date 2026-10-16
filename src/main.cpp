@@ -1,94 +1,185 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <driver/gpio.h>
+#include <time.h>
 
-// 74HC595 connections, matching the schematic net names.
-constexpr uint8_t DATA_PIN   = D8;   // SER_DATA -> DS, pin 14
-constexpr uint8_t CLOCK_PIN  = D10;  // SR_CLK -> SHCP, pin 11
-constexpr uint8_t LATCH_PIN  = D9;   // SR_LATCH -> STCP, pin 12
-constexpr uint8_t ENABLE_PIN = D7;   // DRV_OE_N -> /OE, pin 13 (active low)
-constexpr uint8_t SHIFT_REGISTER_COUNT = 7;
+#include "clock_display.h"
 
-constexpr uint8_t HBRIDGE_A = 0b00000001;  // Q0: least-significant bit
-constexpr uint8_t HBRIDGE_B = 0b00000010;  // Q1: second LSB
+// Credentials stay in an ignored local header; the empty example also builds.
+#if __has_include("clock_config.h")
+#include "clock_config.h"
+#else
+#include "clock_config.example.h"
+#endif
 
-// Safety lockout: leave false until the disconnected H-bridge outputs have
-// been verified to remain off with a meter or oscilloscope.
+namespace {
+
+// Existing XIAO pin connections, matching the schematic net names.
+constexpr uint8_t DATA_PIN = D8;    // SER_DATA -> DS, pin 14
+constexpr uint8_t CLOCK_PIN = D10;  // SR_CLK -> SHCP, pin 11
+constexpr uint8_t LATCH_PIN = D9;   // SR_LATCH -> STCP, pin 12
+constexpr uint8_t ENABLE_PIN = D7;  // DRV_OE_N -> /OE, pin 13 (active low)
+
+// Preserve the user-tested pulse setting; false keeps all commands disabled.
 constexpr bool ENABLE_COIL_PULSES = true;
-
-// Alfa-Zeta specifies a 1 ms coil pulse. Never hold either drive mask on.
-constexpr uint32_t PULSE_TIME_US     = 1000;
-constexpr uint32_t FLIP_INTERVAL_MS  = 10000;
-// Break-before-make coast interval for the DRV8876:
-//   74HC595 latch-to-output: <=265 ns at its slowest rated conditions
-//   DRV8876 input-to-output: 650 ns typical
-//   DRV8876 output fall:     150 ns typical
-// The DRV8876 also inserts 300 ns typical internal MOSFET dead time. TI does
-// not specify maxima for its three timing values, so retain a 5 us margin.
+constexpr uint32_t PULSE_TIME_US = 1000;
 constexpr uint32_t DEAD_TIME_MS = 1;
+constexpr uint32_t WIFI_RETRY_MS = 30000;
+constexpr uint32_t TIME_POLL_MS = 1000;
 
-// Shift a complete byte, then expose it at Q0-Q7 on the latch rising edge.
-void writeShiftRegister(uint8_t value) {
-  digitalWrite(LATCH_PIN, LOW);
-  shiftOut(DATA_PIN, CLOCK_PIN, LSBFIRST, value);
-  digitalWrite(LATCH_PIN, HIGH);
-}
+class RegisterOutputs {
+ public:
+  void begin() {
+    // Arduino core 3 ignores digitalWrite before pinMode. Preload the GPIO
+    // latch directly so enabling output mode never drives OE_N LOW at startup.
+    gpio_set_level(static_cast<gpio_num_t>(ENABLE_PIN), HIGH);
+    pinMode(ENABLE_PIN, OUTPUT);
+    disableOutputs();
+    pinMode(DATA_PIN, OUTPUT);
+    pinMode(CLOCK_PIN, OUTPUT);
+    pinMode(LATCH_PIN, OUTPUT);
 
-// Force every output off. Keep /OE disabled throughout the idle interval.
-void flushOutputs() {
-  // Remove the drive command immediately, before modifying the register.
-  digitalWrite(ENABLE_PIN, HIGH);
-
-  // Clear every 74HC595 in the seven-device daisy chain, then update all
-  // parallel outputs together with a single latch edge.
-  digitalWrite(LATCH_PIN, LOW);
-  for (uint8_t i = 0; i < SHIFT_REGISTER_COUNT; ++i) {
-    shiftOut(DATA_PIN, CLOCK_PIN, LSBFIRST, 0x00);
+    // The physical /OE pull-up covers reset; /OE stays HIGH during this clear.
+    digitalWrite(DATA_PIN, LOW);
+    digitalWrite(CLOCK_PIN, LOW);
+    digitalWrite(LATCH_PIN, LOW);
+    writeFrame(clock_display::Frame{});
+    waitIdle();
   }
-  digitalWrite(LATCH_PIN, HIGH);
 
-  delay(DEAD_TIME_MS);
-}
+  // HIGH disables the 74HC595 parallel outputs (high impedance).
+  void disableOutputs() { digitalWrite(ENABLE_PIN, HIGH); }
+  void enableOutputs() { digitalWrite(ENABLE_PIN, LOW); }
 
-// Apply one short coil pulse, switch all outputs off, then wait until the
-// next 10-second flip interval. The display retains its state magnetically.
-void pulseAndWait(uint8_t value) {
-  const uint32_t pulseStartedAt = millis();
+  void writeFrame(const clock_display::Frame &frame) {
+    // Callers disable /OE first. QA is bit 0; register 7 is transmitted first.
+    digitalWrite(LATCH_PIN, LOW);
+    for (std::size_t i = 0; i < clock_display::REGISTER_COUNT; ++i) {
+      shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, clock_display::wireByte(frame, i));
+    }
+    digitalWrite(LATCH_PIN, HIGH);
+  }
 
-  // Load the command while the shift-register outputs are still disabled.
-  writeShiftRegister(value);
-  digitalWrite(ENABLE_PIN, LOW);
-  delayMicroseconds(PULSE_TIME_US);
-  flushOutputs();
+  void waitLatchSettle() { delayMicroseconds(1); }
+  void waitPulse() { delayMicroseconds(PULSE_TIME_US); }
 
-  while (millis() - pulseStartedAt < FLIP_INTERVAL_MS) {
+  void waitIdle() {
+    // Guarantee a full coast interval even if delay(1) straddles a tick edge.
+    // Yield only after the shared pulse routine has set /OE HIGH and cleared.
+    delayMicroseconds(DEAD_TIME_MS * 1000);
     delay(1);
   }
+};
+
+RegisterOutputs outputs;
+clock_display::DisplayController display;
+
+// Only loop() accesses these or drives registers; Wi-Fi owns no pin callbacks.
+const bool NETWORK_CONFIGURED = clock_config::WIFI_SSID[0] != '\0';
+bool wasConnected = false;
+bool ntpStarted = false;
+bool hasValidTime = false;
+bool waitingForTime = false;
+uint32_t lastWifiAttemptAt = 0;
+uint32_t lastTimePollAt = 0;
+
+void serviceWifi(uint32_t now) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected != wasConnected) {
+    // Every diagnostic happens outside the enabled coil-pulse interval.
+    Serial.println(connected ? "Wi-Fi connected." : "Wi-Fi disconnected; retrying in background.");
+    wasConnected = connected;
+  }
+
+  if (connected && !ntpStarted) {
+    // Start the core's periodic NTP service once; leave it running on outages.
+    configTzTime(clock_config::TIME_ZONE, "pool.ntp.org", "time.nist.gov");
+    ntpStarted = true;
+    waitingForTime = true;
+    Serial.println("Waiting for network time; coil outputs remain disabled.");
+  }
+
+  // Wrap-safe timing limits our explicit reconnect calls to once per 30 seconds.
+  // The core can also retry once internally while establishing a connection.
+  if (!connected && static_cast<uint32_t>(now - lastWifiAttemptAt) >= WIFI_RETRY_MS) {
+    lastWifiAttemptAt = now;
+    WiFi.reconnect();
+    Serial.println("Retrying Wi-Fi connection.");
+  }
 }
 
-void setup() {
-  // Disable the 74HC595 outputs while its internal state is being initialized.
-  // A physical pull-up on /OE also keeps the H-bridge off during ESP32 reset.
-  digitalWrite(ENABLE_PIN, HIGH);
-  pinMode(ENABLE_PIN, OUTPUT);
+void serviceTime(uint32_t now) {
+  // Keep time moving through Wi-Fi outages after the first synchronization.
+  if (!ntpStarted || static_cast<uint32_t>(now - lastTimePollAt) < TIME_POLL_MS) {
+    return;
+  }
+  lastTimePollAt = now;
+  struct tm localTime {};
 
-  pinMode(DATA_PIN, OUTPUT);
-  pinMode(CLOCK_PIN, OUTPUT);
-  pinMode(LATCH_PIN, OUTPUT);
-
-  // Establish known idle levels before the first latch operation.
-  digitalWrite(DATA_PIN, LOW);
-  digitalWrite(CLOCK_PIN, LOW);
-  digitalWrite(LATCH_PIN, LOW);
-
-  flushOutputs();
-}
-
-void loop() {
-  if (!ENABLE_COIL_PULSES) {
-    flushOutputs();
-    delay(1000);
+  // A zero timeout avoids the core's default multi-second NTP wait.
+  if (!getLocalTime(&localTime, 0)) {
+    if (!waitingForTime) {
+      Serial.println("Waiting for valid time; holding the display position.");
+      waitingForTime = true;
+    }
     return;
   }
 
-  pulseAndWait(HBRIDGE_A);
-  pulseAndWait(HBRIDGE_B);
+  // The magnetic display is initially unknown; the first render sets all 28 segments.
+  waitingForTime = false;
+  if (!hasValidTime) {
+    Serial.println("Local time available (U.S. Central with daylight saving).");
+    hasValidTime = true;
+  }
+
+  clock_display::DigitMasks target{};
+  if (!clock_display::renderTime(localTime.tm_hour, localTime.tm_min, target)) {
+    Serial.println("Invalid time fields; coil outputs remain disabled.");
+    return;
+  }
+
+  // The shared routine immediately disables /OE after each nominal 1 ms pulse.
+  const bool completed = display.apply(target, outputs, ENABLE_COIL_PULSES);
+  if (!completed || display.lastPulseCount() == 0) {
+    return;
+  }
+  const int hour12 = localTime.tm_hour % 12 == 0 ? 12 : localTime.tm_hour % 12;
+  Serial.printf("Clock: %2d:%02d (%u segment commands).\n", hour12, localTime.tm_min,
+                static_cast<unsigned int>(display.lastPulseCount()));
+}
+
+}  // namespace
+
+void setup() {
+  // Disable and clear outputs before serial initialization or any network work.
+  outputs.begin();
+  Serial.begin(115200);
+  Serial.println("Electromagnetic clock starting; OE_N HIGH (outputs disabled).");
+  if (!ENABLE_COIL_PULSES) {
+    Serial.println("Coil pulsing is disabled by ENABLE_COIL_PULSES.");
+  }
+
+  // Missing credentials are a buildable idle configuration, never a fake network.
+  if (!NETWORK_CONFIGURED) {
+    Serial.println("Copy include/clock_config.example.h to include/clock_config.h and set Wi-Fi credentials.");
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+
+  // Do not wait for a connection; give the first attempt a full retry window.
+  WiFi.begin(clock_config::WIFI_SSID, clock_config::WIFI_PASSWORD);
+  lastWifiAttemptAt = millis();
+  lastTimePollAt = lastWifiAttemptAt;
+  Serial.println("Connecting to Wi-Fi in the background.");
+}
+
+void loop() {
+  if (NETWORK_CONFIGURED) {
+    // All network calls are outside the shared, bounded pulse sequence.
+    const uint32_t now = millis();
+    serviceWifi(now);
+    serviceTime(now);
+  }
+  delay(1);  // /OE stays HIGH while idle, including an unconfigured startup.
 }
