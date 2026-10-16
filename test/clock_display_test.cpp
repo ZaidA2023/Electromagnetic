@@ -304,6 +304,115 @@ void applyAndCheck(DisplayController &controller, Backend &backend,
   checkPulseTrace(backend, commands, true);
 }
 
+DigitMasks letterMasks(const std::array<const char *, 4> &segments) {
+  DigitMasks masks{};
+  // Spell each letter's strokes independently of the production numeric masks.
+  for (std::size_t digit = 0; digit < 4; ++digit) {
+    for (const char *segment = segments[digit]; *segment; ++segment) {
+      masks[digit] |= static_cast<uint8_t>(1u << (*segment - 'A'));
+    }
+  }
+  return masks;
+}
+
+struct DisplayHold {
+  uint32_t milliseconds;
+  DigitMasks visible;
+  Backend trace;
+};
+
+struct GreetingBackend : Backend {
+  // Start with every stroke visible: a zero register flush cannot blank them.
+  DigitMasks visible = expectedText("8888");
+  std::vector<DisplayHold> holds;
+
+  void waitDisplay(uint32_t milliseconds) {
+    checkSafe(*this);
+    // Decode the actual physical outputs, without consulting COMMANDS or targets.
+    for (std::size_t address : addresses) {
+      CHECK(address < 56);
+      const std::string label = SCHEMATIC[address / 8][address % 8];
+      const std::size_t digit = static_cast<std::size_t>(label[1] - '1');
+      const uint8_t bit = static_cast<uint8_t>(1u << (label[3] - 'A'));
+      visible[digit] = static_cast<uint8_t>(label.substr(5) == "SET"
+                                               ? visible[digit] | bit
+                                               : visible[digit] & ~bit);
+    }
+    // Preserve the entire pulse trace at each safe hold, retaining physical state.
+    holds.push_back(DisplayHold{milliseconds, visible, *this});
+    clearHistory();
+  }
+};
+
+void testStartupGreetingGlyphsAndPhysicalSequence() {
+  const DigitMasks hi = letterMasks({{"", "BCEFG", "EF", ""}});
+  const DigitMasks name = letterMasks({{"ABDEG", "ABCEFG", "EF", "BCDEG"}});
+  // I uses the left verticals; d uses the conventional lowercase approximation.
+  CHECK(clock_display::STARTUP_HI == hi);
+  CHECK(clock_display::STARTUP_NAME == name);
+  DisplayController controller;
+  GreetingBackend backend;
+  CHECK(clock_display::showStartupGreeting(controller, backend, true));
+  CHECK(backend.holds.size() == 3);
+
+  // Each snapshot proves the word, exact schematic sequence, and completed count.
+  const DigitMasks targets[] = {hi, DigitMasks{}, name};
+  const uint32_t durations[] = {1000, 250, 2000};
+  const std::size_t counts[] = {28, 7, 18};
+  for (std::size_t stage = 0; stage < 3; ++stage) {
+    context = "greeting stage " + std::to_string(stage);
+    const DisplayHold &hold = backend.holds[stage];
+    CHECK(hold.milliseconds == durations[stage]);
+    CHECK(hold.visible == targets[stage]);
+    CHECK(hold.trace.addresses.size() == counts[stage]);
+    // Existing trace checks also require OE disabled and every latch zero.
+    checkPulseTrace(hold.trace,
+                    expectedCommands(targets[stage], stage ? &targets[stage - 1] : nullptr),
+                    true);
+  }
+  // The last hold must leave the name retained, with no subsequent output work.
+  CHECK(controller.lastPulseCount() == 18);
+  CHECK(backend.visible == name);
+  CHECK(backend.addresses.empty());
+  CHECK(backend.events.empty());
+  checkSafe(backend);
+}
+
+void testStartupGreetingHandoffAndDisabledState() {
+  const DigitMasks name = letterMasks({{"ABDEG", "ABCEFG", "EF", "BCDEG"}});
+  for (int padding = 0; padding < 2; ++padding) {
+    context = padding ? "greeting to 01:00" : "greeting to blank-1:00";
+    DisplayController controller;
+    GreetingBackend backend;
+    CHECK(clock_display::showStartupGreeting(controller, backend, true));
+    CHECK(backend.holds.size() == 3);
+    // Exercise the public time renderer before checking the physical handoff.
+    DigitMasks time{};
+    CHECK(clock_display::renderTime(1, 0, time, padding != 0));
+    CHECK(time == expectedText(padding ? "0100" : " 100"));
+
+    // Handoff must use the cached name, including D1 resets or a real zero glyph.
+    applyAndCheck(controller, backend, time, &name);
+    CHECK(controller.lastPulseCount() == (padding ? 14u : 16u));
+    applyAndCheck(controller, backend, time, &time);
+    CHECK(controller.lastPulseCount() == 0);
+    CHECK(backend.holds.size() == 3);
+
+    // Lockout must clear unsafe initial latches without any pulse or display hold.
+    DisplayController disabledController;
+    GreetingBackend disabledBackend;
+    CHECK(!clock_display::showStartupGreeting(disabledController, disabledBackend, false));
+    CHECK(disabledController.lastPulseCount() == 0);
+    CHECK(disabledBackend.holds.empty());
+    checkRejectedTrace(disabledBackend);
+
+    // No skipped greeting target may mark any segment known, even a hidden D1.
+    applyAndCheck(disabledController, disabledBackend, time, nullptr);
+    CHECK(disabledController.lastPulseCount() == 28);
+    CHECK(disabledBackend.holds.empty());
+  }
+}
+
 void testMapping() {
   CHECK(clock_display::REGISTER_COUNT == 7);
   CHECK(clock_display::DIGIT_COUNT == 4);
@@ -405,6 +514,14 @@ void testGlyphsAndAllMinutes() {
       DigitMasks actual = {{0xff, 0xff, 0xff, 0xff}};
       CHECK(clock_display::renderTime(hour, minute, actual));
       CHECK(actual == expectedTime(hour, minute));
+
+      // Check optional padding against the independent textual hour chart.
+      DigitMasks padded = expectedTime(hour, minute);
+      if (padded[0] == 0) {
+        padded[0] = expectedGlyph('0');
+      }
+      CHECK(clock_display::renderTime(hour, minute, actual, true));
+      CHECK(actual == padded);
     }
   }
   // Keep the named presentation boundaries visible alongside the exhaustive run.
@@ -419,6 +536,13 @@ void testGlyphsAndAllMinutes() {
     CHECK(actual == expectedText(example.text));
   }
   CHECK(expectedGlyph(' ') == 0);
+
+  // The requested example must differ only in its first digit.
+  DigitMasks example{};
+  CHECK(clock_display::renderTime(1, 0, example, false));
+  CHECK(example == expectedText(" 100"));
+  CHECK(clock_display::renderTime(1, 0, example, true));
+  CHECK(example == expectedText("0100"));
 }
 
 void testInvalidTimeFields() {
@@ -432,6 +556,9 @@ void testInvalidTimeFields() {
               std::to_string(fields[1]);
     DigitMasks target = sentinel;
     CHECK(!clock_display::renderTime(fields[0], fields[1], target));
+    CHECK(target == sentinel);
+    // Padding must not bypass field validation or modify a rejected target.
+    CHECK(!clock_display::renderTime(fields[0], fields[1], target, true));
     CHECK(target == sentinel);
   }
 }
@@ -765,6 +892,8 @@ int main() {
       {"invalid requests preserve unknown/known state", testInvalidMasksPreserveUnknownAndKnownState},
       {"one target snapshot per update", testTargetSnapshot},
       {"Central timezone and exact 2026 DST boundaries", testCentralTimeAnd2026Boundaries},
+      {"startup greeting glyphs, physical sequence, and safe holds", testStartupGreetingGlyphsAndPhysicalSequence},
+      {"startup greeting cached handoff and disabled unknown state", testStartupGreetingHandoffAndDisabledState},
   };
   std::size_t failures = 0;
   // Run independent cases after a failure, with enough context to locate a bad

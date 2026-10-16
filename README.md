@@ -2,17 +2,19 @@
 
 This PlatformIO Arduino project targets the Seeed XIAO ESP32-C6. Seven daisy-chained 74HC595 shift registers provide 56 command outputs for four magnetic seven-segment digits, ordered D1 through D4 from left to right. Every segment has a SET command that makes it visible and a RESET command that hides it. The display retains its position after the pulse ends.
 
-The firmware connects to Wi-Fi, synchronizes the ESP32 clock using NTP, and displays 12-hour U.S. Central time with automatic daylight saving changes. Hours 1-9 have a blank first digit; minutes always have two digits. Midnight and noon show 12. There are no mapped AM/PM or colon outputs.
+The firmware connects to Wi-Fi, synchronizes the ESP32 clock using NTP, and displays 12-hour U.S. Central time with automatic daylight saving changes. Hours 1-9 have a blank first digit by default; minutes always have two digits. Midnight and noon show 12. There are no mapped AM/PM or colon outputs.
+
+Set `SHOW_LEADING_HOUR_ZERO` near the top of `src/main.cpp` to `true` for `01:00`, or `false` for `1:00` with the first digit blank. Rebuild and upload after changing this flag. Serial clock diagnostics follow the same setting.
 
 ## Wi-Fi configuration
 
 Edit the local `include/clock_config.h` file and fill in `WIFI_SSID` and `WIFI_PASSWORD`. A blank password is supported for an open network. The file is ignored by Git. If it is missing in a new checkout, copy `include/clock_config.example.h` to that filename first; preserve any existing private configuration.
 
-Keep `TIME_ZONE` set to `CST6CDT,M3.2.0,M11.1.0` for the selected Central timezone. The example has empty network credentials so a checkout builds without revealing or inventing credentials. With an empty SSID, outputs stay disabled and the serial monitor explains how to configure the network.
+Keep `TIME_ZONE` set to `CST6CDT,M3.2.0,M11.1.0` for the selected Central timezone. The example has empty network credentials so a checkout builds without revealing or inventing credentials. With an empty SSID, the startup greeting still runs; afterward the name stays visible with outputs disabled and the serial monitor explains how to configure the network.
 
 ## Coil commands
 
-OE_N is **HIGH while idle** and throughout register loading. Each command loads all 56 bits, enables only one command with OE_N LOW for a nominal 1 ms, immediately returns OE_N HIGH, and clears all seven registers. A full 1 ms coast wait precedes an additional scheduler yield before another pulse. On the first valid time, all 28 segments are commanded to establish their position; subsequent updates pulse only changed segments.
+OE_N is **HIGH while idle** and throughout register loading. Each command loads all 56 bits, enables only one command with OE_N LOW for a nominal 1 ms, immediately returns OE_N HIGH, and clears all seven registers. A full 1 ms coast wait precedes an additional scheduler yield before another pulse. The first startup greeting commands all 28 segments to establish their position; subsequent greeting stages and clock updates pulse only changed segments.
 
 The existing wiring uses D8=data, D10=clock, D9=latch, D7=OE_N. Register frames travel farthest first using MSBFIRST; software bit 0 is QA. The exact SET/RESET table, including the user-confirmed D4 B RESET on Register_07 QD, is in [CLOCK_DESIGN.md](CLOCK_DESIGN.md).
 
@@ -20,9 +22,13 @@ The `ENABLE_COIL_PULSES` constant in `src/main.cpp` preserves the existing enabl
 
 ## Startup and network outages
 
-The controller disables outputs and clears the command registers before starting Wi-Fi. It waits for valid time before moving any segments, preserving the physical display position during an offline startup. Wi-Fi connection attempts run in the background with explicit retries every 30 seconds. NTP uses `pool.ntp.org` and `time.nist.gov`; diagnostics use 115200 baud and never print the password.
+The controller initializes outputs disabled, then shows **centered Hi for 1 second → physically blank for 250 ms → ZAId for 2 seconds**, before any Wi-Fi setup. Seven-segment letters use H/I shapes, a Z shaped like 2, and lowercase d for D. The text holds happen with OE_N HIGH and cleared command registers; the coils receive only their normal short pulses. Hold durations are the `STARTUP_*_HOLD_MS` constants in `include/clock_display.h`.
 
-After synchronization, the system clock continues driving updates during a Wi-Fi outage while power remains on. Long outages can accumulate clock drift. An ordinary power cycle loses time and waits for synchronization again; there is no battery-backed RTC in this design.
+The greeting runs once per reset, including when the network is unconfigured or unavailable. ZAId stays visible after its 2-second hold until valid time can replace it. If `ENABLE_COIL_PULSES` is false, the greeting and holds are skipped. See [STARTUP_DESIGN.md](STARTUP_DESIGN.md) for the exact glyphs and sequence.
+
+Wi-Fi starts after the greeting and connects in the background with explicit retries every 30 seconds. NTP uses `pool.ntp.org` and `time.nist.gov`; diagnostics use 115200 baud and never print the password. Reconnection does not replay the greeting.
+
+After synchronization, the system clock continues driving updates during a Wi-Fi outage while power remains on. Long outages can accumulate clock drift. An ordinary power cycle repeats the greeting and waits for synchronization again; there is no battery-backed RTC in this design.
 
 ## Build and monitor
 

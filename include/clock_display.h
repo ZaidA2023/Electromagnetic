@@ -32,6 +32,14 @@ constexpr uint8_t DIGIT_GLYPHS[10] = {
     0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f,
 };
 
+// Conventional seven-segment letters: H=BCEFG, I=EF, Z=ABDEG, A=ABCEFG, d=BCDEG.
+// Center Hi; use all four positions for ZAId. These holds never energize coils.
+constexpr DigitMasks STARTUP_HI = {{0x00, 0x76, 0x30, 0x00}};
+constexpr DigitMasks STARTUP_NAME = {{0x5b, 0x77, 0x30, 0x5e}};
+constexpr uint32_t STARTUP_HI_HOLD_MS = 1000;
+constexpr uint32_t STARTUP_BLANK_HOLD_MS = 250;
+constexpr uint32_t STARTUP_NAME_HOLD_MS = 2000;
+
 inline bool makePulseFrame(std::size_t address, Frame &frame) {
   // Erase stale commands even when rejecting an invalid output address.
   frame.fill(0);
@@ -47,15 +55,16 @@ inline uint8_t wireByte(const Frame &frame, std::size_t index) {
   return index < REGISTER_COUNT ? frame[REGISTER_COUNT - 1 - index] : 0;
 }
 
-inline bool renderTime(int hour24, int minute, DigitMasks &target) {
+inline bool renderTime(int hour24, int minute, DigitMasks &target,
+                       bool showLeadingHourZero = false) {
   // Reject bad time fields before using them as glyph-table indices.
   if (hour24 < 0 || hour24 > 23 || minute < 0 || minute > 59) {
     return false;
   }
   const int hour12 = hour24 % 12 == 0 ? 12 : hour24 % 12;
 
-  // Hours 1-9 have blank tens; minutes always retain their leading zero.
-  target[0] = hour12 >= 10 ? DIGIT_GLYPHS[hour12 / 10] : 0;
+  // Optional hour padding uses a real zero glyph; minutes always have two digits.
+  target[0] = hour12 >= 10 || showLeadingHourZero ? DIGIT_GLYPHS[hour12 / 10] : 0;
   target[1] = DIGIT_GLYPHS[hour12 % 10];
   target[2] = DIGIT_GLYPHS[minute / 10];
   target[3] = DIGIT_GLYPHS[minute % 10];
@@ -144,5 +153,27 @@ class DisplayController {
   DigitMasks known_{};
   std::size_t lastPulseCount_ = 0;
 };
+
+template <typename Backend>
+bool showStartupGreeting(DisplayController &display, Backend &output, bool pulsesEnabled) {
+  // Establish all unknown positions before the first text hold; false aborts idle.
+  if (!display.apply(STARTUP_HI, output, pulsesEnabled)) {
+    return false;
+  }
+  output.waitDisplay(STARTUP_HI_HOLD_MS);
+
+  // A magnetic display needs RESET pulses to become blank, not just zero registers.
+  if (!display.apply(DigitMasks{}, output, pulsesEnabled)) {
+    return false;
+  }
+  output.waitDisplay(STARTUP_BLANK_HOLD_MS);
+
+  // Reuse this controller for the clock so its first update replaces the name.
+  if (!display.apply(STARTUP_NAME, output, pulsesEnabled)) {
+    return false;
+  }
+  output.waitDisplay(STARTUP_NAME_HOLD_MS);
+  return true;
+}
 
 }  // namespace clock_display

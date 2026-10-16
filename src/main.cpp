@@ -14,6 +14,9 @@
 
 namespace {
 
+// true: 01:00; false: blank first digit for 1:00. Rebuild after changing.
+constexpr bool SHOW_LEADING_HOUR_ZERO = true;
+
 // Existing XIAO pin connections, matching the schematic net names.
 constexpr uint8_t DATA_PIN = D8;    // SER_DATA -> DS, pin 14
 constexpr uint8_t CLOCK_PIN = D10;  // SR_CLK -> SHCP, pin 11
@@ -62,6 +65,9 @@ class RegisterOutputs {
 
   void waitLatchSettle() { delayMicroseconds(1); }
   void waitPulse() { delayMicroseconds(PULSE_TIME_US); }
+
+  // Magnetic segments hold the text while /OE is HIGH and all commands are zero.
+  void waitDisplay(uint32_t milliseconds) { delay(milliseconds); }
 
   void waitIdle() {
     // Guarantee a full coast interval even if delay(1) straddles a tick edge.
@@ -125,7 +131,7 @@ void serviceTime(uint32_t now) {
     return;
   }
 
-  // The magnetic display is initially unknown; the first render sets all 28 segments.
+  // The startup greeting establishes segment state; the clock reuses that cache.
   waitingForTime = false;
   if (!hasValidTime) {
     Serial.println("Local time available (U.S. Central with daylight saving).");
@@ -133,7 +139,8 @@ void serviceTime(uint32_t now) {
   }
 
   clock_display::DigitMasks target{};
-  if (!clock_display::renderTime(localTime.tm_hour, localTime.tm_min, target)) {
+  if (!clock_display::renderTime(localTime.tm_hour, localTime.tm_min, target,
+                                 SHOW_LEADING_HOUR_ZERO)) {
     Serial.println("Invalid time fields; coil outputs remain disabled.");
     return;
   }
@@ -144,7 +151,9 @@ void serviceTime(uint32_t now) {
     return;
   }
   const int hour12 = localTime.tm_hour % 12 == 0 ? 12 : localTime.tm_hour % 12;
-  Serial.printf("Clock: %2d:%02d (%u segment commands).\n", hour12, localTime.tm_min,
+  Serial.printf(SHOW_LEADING_HOUR_ZERO ? "Clock: %02d:%02d (%u segment commands).\n"
+                                      : "Clock: %2d:%02d (%u segment commands).\n",
+                hour12, localTime.tm_min,
                 static_cast<unsigned int>(display.lastPulseCount()));
 }
 
@@ -157,6 +166,14 @@ void setup() {
   Serial.println("Electromagnetic clock starting; OE_N HIGH (outputs disabled).");
   if (!ENABLE_COIL_PULSES) {
     Serial.println("Coil pulsing is disabled by ENABLE_COIL_PULSES.");
+  }
+
+  // Finish every greeting stage before any Wi-Fi setup or missing-SSID return.
+  if (ENABLE_COIL_PULSES) {
+    Serial.println("Startup greeting: Hi, blank, ZAId.");
+    if (!clock_display::showStartupGreeting(display, outputs, ENABLE_COIL_PULSES)) {
+      Serial.println("Startup greeting rejected; outputs remain disabled.");
+    }
   }
 
   // Missing credentials are a buildable idle configuration, never a fake network.

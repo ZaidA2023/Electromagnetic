@@ -1,6 +1,6 @@
 # Wi-Fi time for the electromagnetic clock
 
-Status: approved design implemented; host tests, ESP32-C6 builds, and independent code reviews complete. User Wi-Fi configuration and physical acceptance remain.
+Status: approved clock design implemented, with the user-requested startup greeting and optional leading hour zero added. See STARTUP_DESIGN.md for the greeting amendment; current verification is recorded below. Physical acceptance remains.
 
 ## Problem
 
@@ -15,7 +15,8 @@ The existing ESP32-C6 firmware proves that a nominal 1 ms command pulse can flip
 - D1/D2 display hours and D3/D4 display minutes, ordered left to right.
 - Standard seven-segment positions: A=top, B=upper right, C=lower right, D=bottom, E=lower left, F=upper left, G=middle.
 - SET makes a segment visible; RESET hides it. The user confirms the existing nominal 1 ms test works.
-- Use 12-hour time. Proposed presentation default: blank D1 for hours 1-9; midnight and noon both show `12:MM`. There are no mapped AM/PM or colon-control outputs; all 56 outputs are assigned to segments.
+- Use 12-hour time. Default: blank D1 for hours 1-9; `SHOW_LEADING_HOUR_ZERO` near the top of `src/main.cpp` optionally shows the zero glyph instead. Midnight and noon both show `12:MM` in either mode. There are no mapped AM/PM or colon-control outputs; all 56 outputs are assigned to segments.
+- Before Wi-Fi setup, show centered Hi for 1000 ms, physically blank for 250 ms, then ZAId for 2000 ms. This user-confirmed amendment is detailed in [STARTUP_DESIGN.md](STARTUP_DESIGN.md). Skip the greeting and all its holds if coil pulsing is disabled.
 - Use the POSIX rule `CST6CDT,M3.2.0,M11.1.0`, matching U.S. Central time with automatic daylight saving changes, as explicitly selected by the user.
 - Never activate multiple segment commands together. Preserve a nominal 1000 us pulse and at least 1 ms of disabled time between pulses.
 - This work adds firmware and configuration instructions. Uploading to a connected clock is a separate action.
@@ -24,6 +25,7 @@ The existing ESP32-C6 firmware proves that a nominal 1 ms command pulse can flip
 
 ```mermaid
 flowchart LR
+  S[Hi then blank then ZAId] --> W
   W[Wi-Fi connection] --> N[NTP synchronization]
   N --> T[ESP32 system clock]
   T --> Z[Central local time]
@@ -86,7 +88,7 @@ The main task alone owns register writes. No network callback may drive a pin. D
 
 Retain the existing `ENABLE_COIL_PULSES` switch, enabled as in the tested firmware. If it is false, keep outputs disabled and do not mark any segment as successfully commanded. The pulse primitive rejects out-of-range command addresses without enabling outputs.
 
-Store both last-commanded masks and known-state masks, each four bytes with bits A-G in positions 0-6. At startup all segments are unknown. Once valid local time is available, command every segment once to its requested visible or hidden position, including the seven RESET pulses needed for a blank D1. After each completed pulse, mark only that segment known and update only its commanded bit. Later renders command only unknown or changed segments. State records commands sent, not sensor-confirmed mechanical feedback; this hardware has no feedback channel.
+Store both last-commanded masks and known-state masks, each four bytes with bits A-G in positions 0-6. At startup all segments are unknown. The first Hi greeting commands every segment once to establish visible and hidden positions. Blanking, the name, and the clock reuse the same controller/cache and command only changed or still-unknown segments. After each completed pulse, mark only that segment known and update only its commanded bit. State records commands sent, not sensor-confirmed mechanical feedback; this hardware has no feedback channel.
 
 The display update uses a local snapshot of the target masks, visits D1-D4 and A-G in that order, and finishes the bounded sequence with all outputs disabled. A new time snapshot is handled on the next scheduled poll. No long delay remains from the ten-second test loop.
 
@@ -94,11 +96,13 @@ The display update uses a local snapshot of the target masks, visits D1-D4 and A
 
 Initialize /OE HIGH and configure pins before Wi-Fi setup, then load and latch seven zero bytes. Start serial diagnostics at 115200 baud while outputs are disabled. If a private `include/clock_config.h` exists, include it; otherwise include the committed `include/clock_config.example.h`. Both use the same `clock_config` namespace with `WIFI_SSID`, `WIFI_PASSWORD`, and `TIME_ZONE` string constants. The example has an empty SSID/password and the confirmed Central timezone rule. Ignore only the private header in Git; never print the password.
 
-An empty SSID means unconfigured: report the required local configuration once, keep the register outputs disabled, and do not attempt a connection or pulse. An empty password with a nonempty SSID is allowed for an open network. A local private header may be populated by the user after approval; no credentials are required in the conversation or committed files.
+Run the enabled greeting after diagnostics and before checking credentials or starting Wi-Fi. `showStartupGreeting` applies Hi, a blank target, and ZAId, with yielding holds of 1000/250/2000 ms after their completed renders. Registers are zeroed and /OE is HIGH during every hold; no hold extends coil energization. This runs once per reset and never on reconnection. It adds the three holds plus command execution to the start of networking.
+
+An empty SSID means unconfigured: after the greeting, report the required local configuration once, leave the name visible with outputs disabled, and do not attempt a connection or further pulse. An empty password with a nonempty SSID is allowed for an open network. With pulse lockout, skip the greeting/holds entirely and retain the old physical display. A local private header may be populated by the user; no credentials are required in the conversation or committed files.
 
 With credentials present, select station mode and start `WiFi.begin` without a connection-wait loop. On the first observed connected state, call `configTzTime` once with the configured rule and two servers. Once initialized, leave the SNTP service running through disconnects and reconnections. Poll connection state from `loop`; request reconnection at most once every 30 seconds while disconnected, using wrap-safe elapsed-millis arithmetic. No automatic reconnect feature is also enabled by application code, to avoid two competing retry policies.
 
-Use `getLocalTime(&timeinfo, 0)` at a wrap-safe 1000 ms polling interval. With this API, zero is the timeout: the firmware must not use its default multi-second wait. Before a successful read, hold the existing physical display position and keep all outputs disabled. There is no startup guess such as 00:00. Once synchronized, the ESP32 system clock continues advancing during a Wi-Fi outage while powered; continue rendering that local time and reconnect in the background. Drift during prolonged outages and loss of time on an ordinary power cycle remain limitations without a battery-backed RTC.
+Use `getLocalTime(&timeinfo, 0)` at a wrap-safe 1000 ms polling interval. With this API, zero is the timeout: the firmware must not use its default multi-second wait. Before a successful read, retain the greeting's name with outputs disabled; the first valid clock target replaces it through the same state cache. There is no clock guess such as 00:00. Once synchronized, the ESP32 system clock continues advancing during a Wi-Fi outage while powered; continue rendering that local time and reconnect in the background. Drift during prolonged outages and loss of time on an ordinary power cycle remain limitations without a battery-backed RTC.
 
 Report configuration status, connection state changes, waiting for the first valid time, and completed display updates while /OE is HIGH. Avoid a diagnostic line on every loop. All waits of significant duration outside the 1 ms pulse occur with outputs disabled and yield to the ESP32 framework.
 
@@ -164,7 +168,7 @@ Use fixed-size C++11-compatible types in a `clock_display` namespace, without dy
 - A `SegmentCommand` holds a SET address and a RESET address. The 4 by 7 table must match both transcription tables above. Every address 0-55 must appear exactly once across all entries.
 - A `Frame` holds seven bytes in nearest-to-farthest register order. A single-command constructor first zeroes all seven bytes, validates the address, then sets only its addressed bit. Invalid addresses return failure and cannot enable outputs.
 - A wire-byte accessor selects frame bytes in reverse register order. The hardware backend writes them with MSBFIRST; tests simulate the corresponding serial bit sequence and latch.
-- A time-rendering helper accepts a valid 24-hour hour and minute and produces four target masks. Compute hour12 as `hour24 % 12`, replacing zero with 12. For hour12 below 10, D1 is blank; minutes always have two digits. Invalid hour/minute inputs return failure rather than indexing a digit table.
+- A time-rendering helper accepts a valid 24-hour hour and minute and produces four target masks. Compute hour12 as `hour24 % 12`, replacing zero with 12. Its optional `showLeadingHourZero` argument defaults to false: D1 is blank below hour 10, or the zero glyph when true. Minutes always have two digits. Invalid hour/minute inputs return failure rather than indexing a digit table.
 - A backend-independent pulse routine owns the seven-step sequence specified above. Its backend provides disable, write-frame, latch-settle wait, enable, pulse wait, and idle wait operations. Hardware methods implement the defined nominal waits and frame transfer; fake methods record their calls. No network or diagnostics operation belongs in this routine.
 - A small display controller holds four last-commanded masks and four known-state masks, initialized to zero. For each A-G bit that is unknown or differs, choose SET or RESET, run the pulse routine, and update that bit only on success. If pulsing is disabled or any command fails, leave the uncommanded bits unknown and return without enabling more outputs. A completed unchanged render emits no pulses.
 
@@ -172,16 +176,16 @@ The ESP32 hardware backend lives in `src/main.cpp`. `writeFrame` always lowers t
 
 Startup refinement from inspecting Arduino core 3.3.7: its `digitalWrite` ignores a pin until `pinMode` registers it as GPIO. Preload the /OE output latch using `gpio_set_level` from `driver/gpio.h` with the existing D7 alias, configure it as OUTPUT, and immediately call `disableOutputs` again. This satisfies the specified HIGH-before-output-mode startup behavior and avoids relying on a pre-pinMode Arduino write that has no effect. The physical pull-up continues to cover reset.
 
-Select the private header with a compiler-supported include-existence check, falling back to the example. Both define only the three string constants specified above in the same namespace. The committed example must build without being copied. An unconfigured build stays idle, as specified; use a clear serial message rather than a compile failure or a fabricated network.
+Select the private header with a compiler-supported include-existence check, falling back to the example. Both define only the three string constants specified above in the same namespace. The committed example must build without being copied. An unconfigured build shows the enabled greeting and then stays idle, as specified; use a clear serial message rather than a compile failure or a fabricated network.
 
 Keep setup and each loop operation small, with comments explaining physical ordering, bit order, state uncertainty, and retry behavior. Under the user's required later code review, flag executable stretches longer than ten lines without a useful comment, as well as substantive correctness issues.
 
 ### Main-loop sequence
 
-1. During setup, initialize pins and load the idle frame, then start diagnostics. If configured, explicitly disable framework auto-reconnect with `WiFi.setAutoReconnect(false)`, select station mode, and call `WiFi.begin` once. Seed retry timestamps so the first begin attempt receives its full 30-second window.
+1. During setup, initialize pins and load the idle frame, then start diagnostics and complete the enabled startup greeting. Only afterward, if configured, select station mode, explicitly disable framework auto-reconnect with `WiFi.setAutoReconnect(false)`, and call `WiFi.begin` once. Seed retry timestamps afterward so the first begin attempt receives its full 30-second window. Unconfigured startup returns only after the greeting; lockout skips all greeting stages/holds.
 2. On every loop pass with outputs idle, observe connection changes. Initialize timezone/NTP only on the first connected observation. For a disconnected configured device, retry with `WiFi.reconnect` only when 30 seconds have elapsed since the last explicit attempt; measure intervals using unsigned subtraction.
 3. If configured and NTP has been started, at most once per 1000 ms call `getLocalTime(&timeinfo, 0)`. A failed read leaves the physical display and command-state cache alone. A successful read supplies one complete hour/minute snapshot for rendering.
-4. Apply that target through the shared display controller. It may send up to 28 sequential pulses on the first render and only changed segments thereafter. The pulse switch is checked before commanding or updating known state. Return with /OE HIGH.
+4. Apply that target through the shared display controller. The greeting already initialized all 28 segments; clock updates send only the changes needed to replace the prior target. The pulse switch is checked before commanding or updating known state. Return with /OE HIGH.
 5. Emit any pending diagnostics while disabled, and yield briefly with `delay(1)`. Polling and retries never use an indefinite wait loop. If unconfigured, skip network/time/render work but continue yielding with /OE HIGH.
 
 Time may change asynchronously while a target is applied; finish the small bounded update and use the newest time on the next poll. The backend has no failure-reporting mechanism for a missed mechanical flip. A reset discards all known-state cache entries, forcing a complete target render after time is available again.
@@ -220,7 +224,7 @@ Human approval: received on 2026-10-16. The user explicitly instructed: "okay th
 
 Execution status: firmware, configuration convention, host tests, and documentation are implemented. Verification and code-review results are recorded below. No device upload has been performed or is authorized by this approval.
 
-## Implementation verification
+## Initial implementation verification
 
 - Host tests: strict C++11 compilation with `-Wall -Wextra -Werror -pedantic` succeeds; all 14 test groups pass. Coverage includes all 56 physical command addresses, seven-register shift simulation, exact pulse-operation ordering, every minute of the day, unknown/known state, disabled and invalid requests, target snapshots, and 2026 Central DST boundaries.
 - Device toolchain: PlatformIO Core 6.2.0, Seeed platform commit `024c190fef52da02ebae5c09d47c101e0ff0762a`, Arduino ESP32 3.3.7, esptool 5.1.2. The platform URL is pinned to the resolved and tested commit. No global platform source/package has been manually edited.
@@ -230,3 +234,11 @@ Execution status: firmware, configuration convention, host tests, and documentat
 - Mean source review, round 1: identified the ineffective pre-pinMode Arduino write as P1. The GPIO-latch preload and post-pinMode HIGH fix resolve it; the reviewer rechecked the latest source and reported no substantive findings or comment-length violations. Review noted that the core may perform one internal initial-connection retry even with automatic reconnection disabled; application-initiated retries remain limited to one per 30 seconds.
 - Independent mean review of the final source and tests: no substantive correctness issues. Two P3 observations concerned qualifying application-initiated Wi-Fi retries and adding comments to the fake backend's load/enable/idle invariants; both are corrected. The reviewer confirmed the boot fix against the actual GPIO implementation and found the tests use independent expectations. Repeated review reached only trivial issues, as required by the workflow.
 - Whitespace check: `git diff --check` passes. Firmware upload, real Wi-Fi synchronization, electrical timing, and mechanical display acceptance remain unperformed.
+
+### Leading hour zero option
+
+The user requested a top-of-file flag selecting `1:00` versus `01:00`. This is a small formatting amendment handled under the workflow's trivial-change exception. `SHOW_LEADING_HOUR_ZERO` defaults to false and is passed to the existing renderer; serial diagnostics use the same choice. The output mapping and pulse sequencing are unchanged. Existing rendering checks cover all 1440 minutes in both modes, the exact requested example, and invalid input with padding enabled. The expanded 14-group suite and ESP32-C6 build passed before integrating the greeting; verification of the combined changes is recorded in STARTUP_DESIGN.md.
+
+### Current greeting and formatting verification
+
+The combined implementation passes all 16 strict C++11 host groups, an independent mean source review, the configured ESP32-C6 build, and a separate no-credentials build. The greeting completes in setup before Wi-Fi setup or the unconfigured return, and every text hold occurs with outputs disabled. The top-level leading-zero flag controls both the physical time masks and serial formatting. See [STARTUP_DESIGN.md](STARTUP_DESIGN.md) for full results and memory sizes. No firmware has been uploaded; actual display operation and electrical timing remain physical acceptance work.

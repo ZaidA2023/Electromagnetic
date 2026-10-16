@@ -1,6 +1,6 @@
 # Startup greeting amendment
 
-Status: amendment to CLOCK_DESIGN.md has passed independent design reviews; awaiting human approval. Existing firmware is unchanged by this document.
+Status: greeting and leading-hour-zero option implemented, with host tests, independent source review, and both ESP32-C6 builds passing. Firmware upload and physical acceptance remain.
 
 ## Problem
 
@@ -74,6 +74,16 @@ Review results:
 - Fresh-context critic review: no actionable findings. The reviewer found the sequence, masks, physical blanking, pulse/hold safety, state cache, offline/disabled behavior, and tests consistent with the existing implementation.
 - Fresh-context implementation-readiness review: READY. No missing implementation decisions; the reviewer confirmed glyphs, holds, physical blanking, safe pulse reuse, cache handoff, offline/disabled behavior, and meaningful test/build coverage.
 
-Human approval: pending.
+Human authorization to implement: on 2026-10-16, after the design reviews, the user renewed the request: "the text with Hi and ZAID did not show up, it should show up before the wifi connects and linger at each word for a little bit, like 1-2 seconds". Implement the reviewed defaults of 1 second for Hi and 2 seconds for ZAId, with the 250 ms visible blank between them.
 
-Implementation status: design only; firmware and tests are unchanged.
+Implementation status: greeting and leading-hour-zero changes are implemented and verified in software. The existing GPIO preload and pulse shutdown sequence are preserved.
+
+## Implementation verification
+
+- The firmware calls the greeting before both `WiFi.mode`/`WiFi.begin` and the missing-SSID early return. The shared controller retains its state into the clock loop. Text holds yield with outputs disabled and command registers cleared.
+- Independent mean source review: no substantive findings. The reviewer confirmed stage order/timings, physical blanking, safe holds, the shared cache, disabled behavior, glyph masks, leading-zero output/serial consistency, and the required comment rule.
+- The pinned ESP32-C6 project build succeeds with networking enabled: 42,284 bytes RAM and 956,822 bytes flash.
+- A separate temporary build with no private configuration also succeeds: 13,852 bytes RAM and 245,274 bytes flash. This checks that the greeting is included before unconfigured startup returns, without reading or modifying private network settings.
+- Expanded host tests: strict C++11 compilation with `-Wall -Wextra -Werror -pedantic` passes; all 16 groups pass. Two new groups reconstruct held letters from independent schematic command logs, verify 28/7/18 commands and 1000/250/2000 ms safe holds, check the name-to-time cache handoff in both leading-zero modes, and ensure disabled greeting leaves positions unknown without pulses or holds. Existing full-day rendering checks cover both padding modes and the explicit `1:00`/`01:00` example.
+- Parent review found the added tests meaningful and consistent with the contract; no substantive findings. Final `git diff --check` passes. Private Wi-Fi settings were not inspected or modified.
+- No firmware has been uploaded. Electrical timing, mechanical motion, and glyph legibility still require checking on the actual clock.
